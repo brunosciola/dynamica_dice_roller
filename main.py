@@ -1,117 +1,95 @@
-import discord
-from discord.ext import commands
-from dotenv import load_dotenv
+import json
 import os
-import re
-from rolagem import roll_dice_complex, extrair_dados
-from reacao import ReacaoManager
+from dotenv import load_dotenv
+import aiohttp
+import asyncio
+from comandos import ComandoBot
 
 load_dotenv()
-TOKEN = os.getenv('TOKEN')
 
-intents = discord.Intents.default()
-intents.message_content = True
+with open("config.json", "r") as f:
+    config = json.load(f)
 
-bot = commands.Bot(command_prefix="!", intents=intents)
-modo_dinamico_por_servidor = {}
-reacao_manager = ReacaoManager()
+plataforma = config["plataforma"]
 
+if plataforma != "stoat":
+    print(f"Plataforma configurada: {plataforma}")
+    print("Este main.py é para Stoat. Ajuste config.json.")
+    exit()
 
-@bot.event
-async def on_ready():
-    print(f"Bot {bot.user.name} está online!")
+token_env = config["stoat"]["token_env"]
+TOKEN = os.getenv(token_env)
 
+if not TOKEN:
+    print(f"Token não encontrado. Verifique se {token_env} está definido no .env")
+    exit()
 
-@bot.command(name="dynamica")
-async def toggle_dynamica(ctx):
-    guild_id = ctx.guild.id
-    modo_dinamico_por_servidor[guild_id] = not modo_dinamico_por_servidor.get(guild_id, False)
-    estado = "ativado" if modo_dinamico_por_servidor[guild_id] else "desativado"
-    await ctx.send(f"Modo dinâmico {estado}!")
+comando_bot = ComandoBot()
 
+API_URL = "https://api.revolt.chat"
+WS_URL = "wss://ws.revolt.chat"
 
-@bot.command(name="joga_reacao")
-async def iniciar_reacao(ctx):
-    reacao_manager.limpar_reacao()
-    reacao_manager.iniciar_reacao()
-    await ctx.send("Modo reação ativado! Comecem a rolar os dados no formato `XdY NOME` (ex: 1d20 Goblin)")
+async def send_message(session, token, channel_id, content):
+    headers = {
+        "x-bot-token": token,
+        "Content-Type": "application/json"
+    }
+    async with session.post(
+        f"{API_URL}/channels/{channel_id}/messages",
+        headers=headers,
+        json={"content": content}
+    ) as resp:
+        if resp.status != 200:
+            print(f"Erro ao enviar mensagem: {resp.status}")
 
+async def main():
+    async with aiohttp.ClientSession() as session:
+        # Autentica e obtém informações do bot
+        headers = {"x-bot-token": TOKEN}
+        async with session.get(f"{API_URL}/users/@me", headers=headers) as resp:
+            if resp.status != 200:
+                print(f"Erro de autenticação: {resp.status}")
+                return
+            bot_info = await resp.json()
+            bot_id = bot_info["_id"]
+            print(f"Bot {bot_info.get('username', 'Desconhecido')} conectado ao Stoat!")
 
-@bot.command(name="fim")
-async def finalizar_reacao(ctx):
-    ordem = reacao_manager.finalizar_reacao()
-    if not ordem:
-        await ctx.send("Nenhuma rolagem registrada!")
-        return
+        # Conecta ao WebSocket
+        ws = await session.ws_connect(WS_URL)
+        await ws.send_json({"type": "Authenticate", "token": TOKEN})
 
-    mensagem = "**Ordem de Reação:**\n"
-    for idx, (nome, resultado) in enumerate(ordem, 1):
-        mensagem += f"{idx}. {nome} ({resultado})\n"
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                data = json.loads(msg.data)
+                
+                if data.get("type") == "Message":
+                    author_id = data.get("author")
+                    
+                    # Ignora mensagens do próprio bot
+                    if author_id == bot_id:
+                        continue
 
-    await ctx.send(mensagem)
+                    channel_id = data.get("channel")
+                    content = data.get("content", "")
+                    
+                    # Tenta obter nome do autor
+                    nome_exibicao = "Usuário"
+                    try:
+                        async with session.get(f"{API_URL}/users/{author_id}", headers=headers) as resp:
+                            if resp.status == 200:
+                                user_info = await resp.json()
+                                nome_exibicao = user_info.get("display_name") or user_info.get("username", "Usuário")
+                    except:
+                        pass
 
+                    resposta = comando_bot.processar(channel_id, author_id, nome_exibicao, content)
 
+                    if resposta:
+                        await send_message(session, TOKEN, channel_id, resposta)
 
-@bot.command(name="vez")
-async def mostrar_vez(ctx):
-    ordem = reacao_manager.obter_ordem_vez()
-    if not ordem:
-        await ctx.send("Nenhuma ordem salva!")
-        return
+            elif msg.type == aiohttp.WSMsgType.ERROR:
+                print(f"WebSocket error: {msg}")
+                break
 
-    mensagem = "**Ordem Salva:**\n"
-    for idx, (nome, resultado) in enumerate(ordem, 1):
-        mensagem += f"{idx}. {nome} ({resultado})\n"
-
-    await ctx.send(mensagem)
-
-
-# main.py atualizado
-@bot.event
-async def on_message(message):
-    if message.author == bot.user:
-        return
-
-    # Processar comandos primeiro
-    await bot.process_commands(message)
-
-    # Verificar rolagens normais
-    padrao_normal = re.compile(r'\b(\d+[dD]\d+([+-]\d+)?)\b')
-    if not reacao_manager.modo_reacao_ativado:
-        correspondencias = padrao_normal.findall(message.content)
-        if correspondencias:
-            resultados = []
-            for match in correspondencias:
-                dice_string = match[0]
-                guild_id = message.guild.id
-                modo_dinamico = modo_dinamico_por_servidor.get(guild_id, False)
-                resultado = roll_dice_complex(dice_string, modo_dinamico)
-                resultados.append(resultado)
-
-            await message.channel.send(f"{message.author.mention} rolou:\n" + "\n".join(resultados))
-
-    # Modo reação ativo
-    else:
-        padrao_reacao = re.compile(r'(\d+[dD]\d+([+-]\d+)?)\s*(.*)')
-        match = padrao_reacao.search(message.content)
-
-        if match:
-            dice_string = match.group(1).strip()
-            nome = match.group(3).strip() or message.author.display_name
-
-            try:
-                # Rolagem técnica para extrair apenas o valor
-                guild_id = message.guild.id
-                modo_dinamico = modo_dinamico_por_servidor.get(guild_id, False)
-                resultado_bruto = roll_dice_complex(dice_string, modo_dinamico)
-
-                # Extrair primeiro valor numérico do resultado
-                valor = int(re.findall(r'\d+', resultado_bruto.split(":")[1])[0])
-                reacao_manager.adicionar_rolagem_reacao(nome, valor)
-
-                await message.channel.send(f"✅ {message.author.mention}: {dice_string} para {nome} ({valor})")
-            except Exception as e:
-                await message.channel.send(f"❌ Erro na rolagem: {str(e)}")
-
-
-bot.run(TOKEN)
+if __name__ == "__main__":
+    asyncio.run(main())
