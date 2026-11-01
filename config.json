@@ -1,0 +1,12 @@
+{
+  "plataforma": "stoat",
+  "prefixo": "/",
+
+  "discord": {
+    "token_env": "DISCORD_TOKEN"
+  },
+
+  "stoat": {
+    "token_env": "STOAT_TOKEN"
+  }
+}
